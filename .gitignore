@@ -80,3 +80,4 @@ __tests__/snapshots/
 # artifacts (see .github/workflows/build-apk.yml). They are no longer
 # committed to the repo.
 *.apk
+node_modules/
