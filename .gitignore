@@ -81,3 +81,6 @@ __tests__/snapshots/
 # committed to the repo.
 *.apk
 node_modules/
+
+# Local release scratch (downloaded artifacts etc.)
+release/
