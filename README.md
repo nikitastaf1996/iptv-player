@@ -18,13 +18,26 @@ The browser-based HTML player suffers from CORS restrictions on most IPTV stream
 
 ## Download APK
 
-Pre-built APKs are produced by GitHub Actions on every push to `main`.
+### Latest build (auto-published on every push)
 
-1. Go to https://github.com/nikitastaf1996/iptv-player/actions
-2. Click the latest successful **Build APK** run
-3. Scroll to **Artifacts** → download `iptv-player-apk`
-4. Unzip — the `.apk` file is inside
-5. Sideload onto your Android device (enable "Install unknown apps" for your file manager / browser if prompted)
+Direct download — always points to the freshest APK:
+
+```
+https://github.com/nikitastaf1996/iptv-player/releases/download/latest/iptv-player-latest.apk
+```
+
+Or browse all releases: https://github.com/nikitastaf1996/iptv-player/releases
+
+### Stable versioned release
+
+[v1.0.0](https://github.com/nikitastaf1996/iptv-player/releases/tag/v1.0.0) — `iptv-player-v1.0.0.apk`
+
+### Install
+
+1. Download the `.apk` file above
+2. Transfer to your Android device (or download directly on the phone)
+3. Tap to install — enable "Install unknown apps" for your file manager / browser if prompted
+4. Open **IPTV Player** from your app drawer
 
 The APK is signed with the standard Android debug keystore — sideloadable, NOT Play-Store-ready.
 

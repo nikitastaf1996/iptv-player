@@ -128,3 +128,43 @@ jobs:
         run: |
           echo "::notice::Run URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           echo "::notice::Download the 'iptv-player-apk' artifact from the run page."
+
+      # -----------------------------------------------------------------
+      # Auto-publish a rolling "latest" prerelease on every push to main.
+      # The release is overwritten (same tag, same asset name) so users
+      # always have one stable URL to the freshest APK:
+      #   https://github.com/<owner>/<repo>/releases/download/latest/iptv-player-latest.apk
+      # -----------------------------------------------------------------
+      - name: Stage APK for release
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          APK=$(ls android/app/build/outputs/apk/release/*.apk android/app/build/outputs/apk/debug/*.apk 2>/dev/null | head -1)
+          if [ -z "$APK" ]; then
+            echo "::error::No APK to publish"
+            exit 1
+          fi
+          cp "$APK" iptv-player-latest.apk
+          ls -lh iptv-player-latest.apk
+
+      - name: Publish / update rolling 'latest' prerelease
+        if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest Build
+          prerelease: true
+          body: |
+            ## Latest Build
+
+            Auto-published from the most recent push to `main`.
+
+            - **Commit:** [`${{ github.sha }}`](https://github.com/${{ github.repository }}/commit/${{ github.sha }})
+            - **Pushed:** ${{ github.event.head_commit.timestamp }}
+            - **Run:** https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            This release is overwritten on every push. For a stable versioned
+            release, see [v1.0.0](https://github.com/${{ github.repository }}/releases/tag/v1.0.0).
+          files: |
+            iptv-player-latest.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
