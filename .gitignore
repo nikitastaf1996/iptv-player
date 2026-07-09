@@ -1,0 +1,82 @@
+# OSX
+.DS_Store
+
+# Xcode
+build/
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+xcuserdata
+*.xccheckout
+*.moved-aside
+DerivedData
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Bundle artifacts
+*.jsbundle
+
+# CocoaPods
+/ios/Pods/
+
+# Expo
+.expo/
+
+# Android / Gradle
+android/.gradle/
+android/build/
+android/app/build/
+android/app/.cxx/
+android/**/.cxx/
+android/**/build/
+android/app/debug.keystore
+android/local.properties
+*.iml
+.idea/
+local.properties
+
+# O4 — Keystores should never be tracked.
+# debug.keystore above is already covered; the patterns below catch any
+# future keystore / jks files committed by accident.
+*.jks
+
+# Node
+node_modules/
+*.log
+.npm
+.yarn/
+
+# BUCK
+buck-out/
+\.buckd/
+*.keystore
+
+# Fastlane
+**/fastlane/report.xml
+**/fastlane/Preview.html
+**/fastlane/screenshots
+**/fastlane/test_output
+
+# Editor
+.vscode/
+.idea/
+
+# Misc
+*.swp
+.DS_Store
+
+# Test output
+coverage/
+__tests__/snapshots/
+
+# APKs are now built by GitHub Actions and distributed as workflow
+# artifacts (see .github/workflows/build-apk.yml). They are no longer
+# committed to the repo.
+*.apk
