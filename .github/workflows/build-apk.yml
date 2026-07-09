@@ -12,6 +12,11 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    # Required so the auto-generated GITHUB_TOKEN can publish releases
+    # via softprops/action-gh-release@v2. Without this, the token defaults
+    # to read-only and the release step fails with HTTP 403.
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout
