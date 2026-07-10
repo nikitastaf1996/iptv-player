@@ -5,10 +5,13 @@ React Native Android app for playing `.m3u` / `.m3u8` IPTV playlists.
 ## Features
 
 - **Load playlist** from URL (M3U / M3U8 format)
+- **Saved playlists library** — every loaded playlist is saved to device storage. Tap a chip at the top to reload it; long-press to delete
 - **Channel list** with logos, group labels, and live search filter
+- **Persisted reachability** — Scan results (ok / bad) are stored per-channel. Reload a playlist later and the green/red dots come back immediately, no rescan needed
 - **Click to play** — HLS streams played natively via ExoPlayer (no CORS issues that plague browser players)
 - **Random** button — picks a random channel (prefers ones still alive after a scan)
 - **Scan & Clean** — tests each stream with an 8s timeout, marks dead, removes them from the list
+- **Reset** — wipe saved reachability data for the active playlist and start fresh
 - **Export** — share the cleaned `.m3u` file via Android share sheet (save to device, send to VLC, etc.)
 - **Cleartext traffic allowed** — HTTP (non-HTTPS) streams work, since most IPTV streams are still served over plain HTTP
 
@@ -57,4 +60,5 @@ cd android
 - React Native 0.86
 - TypeScript
 - react-native-video 6.x (ExoPlayer backend)
+- @react-native-async-storage/async-storage (playlist library + per-channel reachability)
 - Gradle 8 + Android SDK 35

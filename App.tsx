@@ -3,10 +3,13 @@
  *
  * Features:
  *  - Load .m3u / .m3u8 playlist from URL
+ *  - Saved playlists library (AsyncStorage) — tap to reload, long-press to delete
  *  - Channel list with logos + group filter + search
  *  - Click to play (HLS via ExoPlayer — no CORS issues)
  *  - Random channel button (prefers alive ones after a scan)
  *  - Scan & Clean: HEAD/GET each stream with timeout, mark dead, remove
+ *    Reachability results are PERSISTED — next time you load the same
+ *    playlist, the green/red dots come back without re-scanning.
  *  - Export: share the cleaned list as .m3u via Android share sheet
  *
  * Why this works where the browser version didn't:
@@ -15,7 +18,7 @@
  *  - android:usesCleartextTraffic="true" allows http:// streams
  */
 
-import React, { useState, useRef, useCallback, useMemo } from 'react';
+import React, { useState, useRef, useCallback, useMemo, useEffect } from 'react';
 import {
   View,
   Text,
@@ -32,6 +35,17 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Video, { VideoRef, ResizeMode } from 'react-native-video';
+import {
+  SavedPlaylist,
+  ChannelStatusRecord,
+  loadSavedPlaylists,
+  upsertPlaylist,
+  removePlaylist,
+  loadChannelStatuses,
+  mergeChannelStatuses,
+  clearChannelStatuses,
+  defaultPlaylistName,
+} from './src/storage/Storage';
 
 // ---------- Types ----------
 interface Channel {
@@ -40,6 +54,8 @@ interface Channel {
   logo?: string;
   group?: string;
   status: 'unknown' | 'ok' | 'bad' | 'scanning';
+  /** ISO timestamp of the last reachability check, if any. */
+  lastCheckedAt?: string | null;
 }
 
 // ---------- M3U parser ----------
@@ -84,6 +100,25 @@ function parseM3U(text: string): Channel[] {
   return result;
 }
 
+/** Merge persisted reachability records into freshly parsed channels. */
+function applyStoredStatuses(
+  channels: Channel[],
+  records: ChannelStatusRecord[],
+): Channel[] {
+  if (records.length === 0) return channels;
+  const map = new Map<string, ChannelStatusRecord>();
+  for (const r of records) map.set(r.url, r);
+  return channels.map((c) => {
+    const rec = map.get(c.url);
+    if (!rec) return c;
+    return {
+      ...c,
+      status: rec.status,
+      lastCheckedAt: rec.lastCheckedAt,
+    };
+  });
+}
+
 // ---------- Stream test (for scan) ----------
 function testStream(url: string, timeoutMs: number): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
@@ -115,6 +150,8 @@ function testStream(url: string, timeoutMs: number): Promise<boolean> {
 // ---------- Main component ----------
 export default function App() {
   const [playlistUrl, setPlaylistUrl] = useState('');
+  /** URL of the currently-loaded playlist (used as the storage key). */
+  const [activePlaylistUrl, setActivePlaylistUrl] = useState<string>('');
   const [channels, setChannels] = useState<Channel[]>([]);
   const [currentChannel, setCurrentChannel] = useState<Channel | null>(null);
   const [search, setSearch] = useState('');
@@ -125,35 +162,33 @@ export default function App() {
   const [statusMsg, setStatusMsg] = useState('Load a playlist to begin.');
   const [videoError, setVideoError] = useState<string | null>(null);
   const [isLoadingVideo, setIsLoadingVideo] = useState(false);
+  const [savedPlaylists, setSavedPlaylists] = useState<SavedPlaylist[]>([]);
 
   const videoRef = useRef<VideoRef>(null);
   const scanAbortRef = useRef(false);
   const channelsRef = useRef<Channel[]>([]);
   channelsRef.current = channels;
+  const activePlaylistUrlRef = useRef<string>('');
+  activePlaylistUrlRef.current = activePlaylistUrl;
 
-  // Stats
-  const stats = useMemo(() => {
-    let ok = 0, bad = 0;
-    for (const c of channels) {
-      if (c.status === 'ok') ok++;
-      else if (c.status === 'bad') bad++;
-    }
-    return { total: channels.length, ok, bad };
-  }, [channels]);
+  // ---------- Load saved playlists + statuses on mount ----------
+  useEffect(() => {
+    (async () => {
+      const lists = await loadSavedPlaylists();
+      setSavedPlaylists(lists);
+      if (lists.length > 0) {
+        setStatusMsg(`${lists.length} saved playlist${lists.length === 1 ? '' : 's'}. Tap one to load.`);
+      }
+    })();
+  }, []);
 
-  const filteredChannels = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    if (!q) return channels;
-    return channels.filter(
-      (c) =>
-        c.name.toLowerCase().includes(q) ||
-        (c.group && c.group.toLowerCase().includes(q)),
-    );
-  }, [channels, search]);
-
-  // ---------- Load playlist ----------
-  const handleLoad = useCallback(async () => {
-    const url = playlistUrl.trim();
+  // ---------- Load playlist from URL ----------
+  const handleLoad = useCallback(async (urlOverride?: string) => {
+    // urlOverride may also be a React Native event object (e.g. when used as
+    // onSubmitEditing) — guard with a typeof check.
+    const rawUrl =
+      typeof urlOverride === 'string' ? urlOverride : playlistUrl;
+    const url = rawUrl.trim();
     if (!url) {
       Alert.alert('Enter URL', 'Please paste a playlist URL first.');
       return;
@@ -168,10 +203,30 @@ export default function App() {
       const text = await res.text();
       const parsed = parseM3U(text);
       if (parsed.length === 0) throw new Error('No channels found');
-      setChannels(parsed);
+
+      // Pull any persisted reachability records for this playlist.
+      const storedStatuses = await loadChannelStatuses(url);
+      const merged = applyStoredStatuses(parsed, storedStatuses);
+
+      setChannels(merged);
       setCurrentChannel(null);
       setVideoError(null);
-      setStatusMsg(`Loaded ${parsed.length} channels.`);
+      setActivePlaylistUrl(url);
+      setPlaylistUrl(url);
+      setStatusMsg(
+        `Loaded ${merged.length} channels` +
+          (storedStatuses.length ? ' (reachability restored)' : '') +
+          '.',
+      );
+
+      // Persist / update the saved-playlist entry.
+      const updated = await upsertPlaylist({
+        url,
+        name: defaultPlaylistName(url),
+        lastLoadedAt: new Date().toISOString(),
+        channelCount: merged.length,
+      });
+      setSavedPlaylists(updated);
     } catch (e: any) {
       setStatusMsg('Load failed: ' + (e?.message || String(e)));
       Alert.alert('Load failed', e?.message || String(e));
@@ -179,6 +234,31 @@ export default function App() {
       setLoading(false);
     }
   }, [playlistUrl]);
+
+  // ---------- Delete a saved playlist ----------
+  const handleDeletePlaylist = useCallback((url: string) => {
+    Alert.alert(
+      'Remove playlist',
+      'Delete this saved playlist and its cached reachability data?',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: async () => {
+            const updated = await removePlaylist(url);
+            setSavedPlaylists(updated);
+            if (activePlaylistUrlRef.current === url) {
+              setActivePlaylistUrl('');
+              setChannels([]);
+              setCurrentChannel(null);
+              setStatusMsg('Saved playlist removed.');
+            }
+          },
+        },
+      ],
+    );
+  }, []);
 
   // ---------- Play a channel ----------
   const playChannel = useCallback((ch: Channel) => {
@@ -208,6 +288,8 @@ export default function App() {
     const timeoutMs = 8000;
     const snapshot = channelsRef.current.slice();
     let alive = 0, dead = 0;
+    /** Pending reachability updates to persist at the end of the scan. */
+    const updates: ChannelStatusRecord[] = [];
 
     // Run scan sequentially (parallel would hammer the network).
     for (let i = 0; i < snapshot.length; i++) {
@@ -231,9 +313,21 @@ export default function App() {
       }
       if (ok) alive++;
       else dead++;
+      const now = new Date().toISOString();
+      updates.push({ url: ch.url, status: ok ? 'ok' : 'bad', lastCheckedAt: now });
       setChannels((prev) =>
-        prev.map((c) => (c.url === ch.url ? { ...c, status: ok ? 'ok' : 'bad' } : c)),
+        prev.map((c) =>
+          c.url === ch.url
+            ? { ...c, status: ok ? 'ok' : 'bad', lastCheckedAt: now }
+            : c,
+        ),
       );
+    }
+
+    // Persist the reachability results for next launch.
+    const key = activePlaylistUrlRef.current;
+    if (key && updates.length > 0) {
+      await mergeChannelStatuses(key, updates);
     }
 
     if (!scanAbortRef.current) {
@@ -252,6 +346,32 @@ export default function App() {
   const handleStopScan = useCallback(() => {
     scanAbortRef.current = true;
   }, []);
+
+  // ---------- Reset reachability ----------
+  const handleResetStatuses = useCallback(async () => {
+    if (!activePlaylistUrl) {
+      Alert.alert('No playlist', 'Load a playlist first.');
+      return;
+    }
+    Alert.alert(
+      'Reset reachability',
+      'Clear all saved ok/bad markers for this playlist? Channels will go back to "unknown".',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Reset',
+          style: 'destructive',
+          onPress: async () => {
+            await clearChannelStatuses(activePlaylistUrl);
+            setChannels((prev) =>
+              prev.map((c) => ({ ...c, status: 'unknown', lastCheckedAt: null })),
+            );
+            setStatusMsg('Reachability data cleared.');
+          },
+        },
+      ],
+    );
+  }, [activePlaylistUrl]);
 
   // ---------- Export .m3u ----------
   const handleExport = useCallback(async () => {
@@ -298,7 +418,47 @@ export default function App() {
     setVideoError(msg);
   }, []);
 
+  // ---------- Stats ----------
+  const stats = useMemo(() => {
+    let ok = 0, bad = 0;
+    for (const c of channels) {
+      if (c.status === 'ok') ok++;
+      else if (c.status === 'bad') bad++;
+    }
+    return { total: channels.length, ok, bad };
+  }, [channels]);
+
+  const filteredChannels = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return channels;
+    return channels.filter(
+      (c) =>
+        c.name.toLowerCase().includes(q) ||
+        (c.group && c.group.toLowerCase().includes(q)),
+    );
+  }, [channels, search]);
+
   // ---------- Render ----------
+  const renderSavedPlaylist = ({ item }: { item: SavedPlaylist }) => {
+    const isActive = activePlaylistUrl === item.url;
+    return (
+      <TouchableOpacity
+        style={[styles.savedChip, isActive && styles.savedChipActive]}
+        onPress={() => handleLoad(item.url)}
+        onLongPress={() => handleDeletePlaylist(item.url)}
+        disabled={loading || scanning}
+      >
+        <Text
+          style={[styles.savedChipText, isActive && styles.savedChipTextActive]}
+          numberOfLines={1}
+        >
+          {item.name}
+        </Text>
+        <Text style={styles.savedChipMeta}>{item.channelCount} ch</Text>
+      </TouchableOpacity>
+    );
+  };
+
   const renderChannel = ({ item }: { item: Channel }) => {
     const isActive = currentChannel?.url === item.url;
     const initial = item.name.charAt(0).toUpperCase();
@@ -331,6 +491,11 @@ export default function App() {
               {item.group}
             </Text>
           ) : null}
+          {item.lastCheckedAt ? (
+            <Text style={styles.channelLastChecked} numberOfLines={1}>
+              checked {formatRelative(item.lastCheckedAt)}
+            </Text>
+          ) : null}
         </View>
         <View
           style={[
@@ -354,6 +519,20 @@ export default function App() {
           <Text style={styles.headerDot}>● </Text>IPTV Player
         </Text>
       </View>
+
+      {/* Saved playlists */}
+      {savedPlaylists.length > 0 ? (
+        <View style={styles.savedWrap}>
+          <FlatList
+            horizontal
+            data={savedPlaylists}
+            keyExtractor={(item) => item.url}
+            renderItem={renderSavedPlaylist}
+            showsHorizontalScrollIndicator={false}
+            ItemSeparatorComponent={() => <View style={{ width: 8 }} />}
+          />
+        </View>
+      ) : null}
 
       {/* Toolbar */}
       <View style={styles.toolbar}>
@@ -407,6 +586,16 @@ export default function App() {
             <Text style={styles.btnText}>⏹ Stop</Text>
           </TouchableOpacity>
         ) : null}
+        <TouchableOpacity
+          style={[
+            styles.btn,
+            (!activePlaylistUrl || scanning) && styles.btnDisabled,
+          ]}
+          onPress={handleResetStatuses}
+          disabled={!activePlaylistUrl || scanning}
+        >
+          <Text style={styles.btnText}>♻️ Reset</Text>
+        </TouchableOpacity>
         <TouchableOpacity
           style={[styles.btn, channels.length === 0 && styles.btnDisabled]}
           onPress={handleExport}
@@ -531,6 +720,23 @@ export default function App() {
   );
 }
 
+// ---------- Helpers ----------
+function formatRelative(iso: string | null | undefined): string {
+  if (!iso) return '';
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return '';
+  const diff = Date.now() - then;
+  const sec = Math.floor(diff / 1000);
+  if (sec < 60) return 'just now';
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  if (day < 30) return `${day}d ago`;
+  return new Date(iso).toLocaleDateString();
+}
+
 // ---------- Styles ----------
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const VIDEO_HEIGHT = Math.round((SCREEN_WIDTH * 9) / 16);
@@ -553,6 +759,38 @@ const styles = StyleSheet.create({
   },
   headerDot: {
     color: '#4f8cff',
+  },
+  savedWrap: {
+    paddingBottom: 8,
+    paddingHorizontal: 12,
+  },
+  savedChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#1e222b',
+    borderWidth: 1,
+    borderColor: '#2a2f3a',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 16,
+    gap: 6,
+  },
+  savedChipActive: {
+    backgroundColor: 'rgba(79, 140, 255, 0.18)',
+    borderColor: '#4f8cff',
+  },
+  savedChipText: {
+    color: '#e6e8ec',
+    fontSize: 12,
+    fontWeight: '500',
+    maxWidth: 140,
+  },
+  savedChipTextActive: {
+    color: '#4f8cff',
+  },
+  savedChipMeta: {
+    color: '#8b94a7',
+    fontSize: 10,
   },
   toolbar: {
     flexDirection: 'row',
@@ -761,6 +999,11 @@ const styles = StyleSheet.create({
     color: '#8b94a7',
     fontSize: 11,
     marginTop: 2,
+  },
+  channelLastChecked: {
+    color: '#5b6478',
+    fontSize: 10,
+    marginTop: 1,
   },
   statusDot: {
     width: 8,
