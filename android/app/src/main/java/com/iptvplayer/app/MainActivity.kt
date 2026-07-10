@@ -1,4 +1,4 @@
-package com.gpsrecorder
+package com.iptvplayer.app
 
 import com.facebook.react.ReactActivity
 import com.facebook.react.ReactActivityDelegate

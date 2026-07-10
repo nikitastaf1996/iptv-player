@@ -1,4 +1,4 @@
-package com.gpsrecorder
+package com.iptvplayer.app
 
 import android.app.Application
 import com.facebook.react.PackageList

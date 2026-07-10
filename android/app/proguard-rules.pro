@@ -19,7 +19,7 @@
 # ---------------------------------------------------------------------------
 # Our native module (called via reflection from JS through the bridge)
 # ---------------------------------------------------------------------------
--keep class com.gpsrecorder.** { *; }
+-keep class com.iptvplayer.app.** { *; }
 
 # ---------------------------------------------------------------------------
 # Privacy: strip verbose Log.d / Log.v in release builds (see TODO L33).
