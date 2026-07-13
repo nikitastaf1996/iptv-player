@@ -35,11 +35,25 @@
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
         </intent-filter>
+        <!-- Deep link so the foreground-service notification can return to
+             the app via linkingURI="iptvplayer://". -->
+        <intent-filter>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.DEFAULT" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="iptvplayer" />
+        </intent-filter>
       </activity>
 
-      <!-- react-native-background-actions foreground service (autolinked) -->
+      <!-- react-native-background-actions foreground service.
+           The package's own manifest declares the service WITHOUT a
+           foregroundServiceType, which on Android 14+ (API 34+) causes
+           startForeground() to throw ForegroundServiceTypeNotAllowed.
+           We re-declare it here with the same name (the merger merges
+           attributes) and add foregroundServiceType="dataSync".
+           Class name must match the package's: com.asterinet.react.bgactions.RNBackgroundActionsTask -->
       <service
-        android:name="com.asterinet.react.bgactions.RNBackgroundActionsTaskService"
+        android:name="com.asterinet.react.bgactions.RNBackgroundActionsTask"
         android:foregroundServiceType="dataSync"
         android:exported="false" />
 

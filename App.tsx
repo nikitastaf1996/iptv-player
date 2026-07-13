@@ -37,6 +37,9 @@ import {
   Dimensions,
   NativeModules,
   AppState,
+  Platform,
+  PermissionsAndroid,
+  Linking,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Video, { VideoRef, ResizeMode } from 'react-native-video';
@@ -310,46 +313,59 @@ export default function App() {
   // Home, switch apps, even turn the screen off — the scan keeps running and
   // the notification shows live progress. Results are persisted to
   // AsyncStorage every 10 channels so a force-kill won't lose much work.
-  const handleScan = useCallback(async () => {
-    if (channelsRef.current.length === 0) return;
-    if (scanning) return;
+  //
+  // If the foreground service can't start (e.g. user denied POST_NOTIFICATIONS
+  // on Android 13+, or the OEM blocks background services), we transparently
+  // fall back to running the same scan inline so the app stays usable.
 
-    setScanning(true);
-    scanAbortRef.current = false;
-    const total = channelsRef.current.length;
-    setScanTotal(total);
-    setScanProgress(0);
+  /**
+   * Request POST_NOTIFICATIONS permission on Android 13+ (API 33+).
+   * Returns true if granted (or not needed). The promise never rejects —
+   * a denial returns false and the caller decides what to do.
+   */
+  const ensureNotificationPermission = useCallback(async (): Promise<boolean> => {
+    if (Platform.OS !== 'android') return true;
+    if (Platform.Version < 33) return true; // TIRAMISU
+    try {
+      const granted = await PermissionsAndroid.check(
+        PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS,
+      );
+      if (granted) return true;
+      const result = await PermissionsAndroid.request(
+        PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS,
+        {
+          title: 'Scan progress notifications',
+          message:
+            'IPTV Player needs to show a notification while scanning channels in the background.',
+          buttonPositive: 'Allow',
+          buttonNegative: 'Deny',
+          buttonNeutral: 'Ask me later',
+        },
+      );
+      return result === PermissionsAndroid.RESULTS.GRANTED;
+    } catch {
+      // Permission request itself failed — assume denied, fall back to inline.
+      return false;
+    }
+  }, []);
 
-    const timeoutMs = 8000;
-    const snapshot = channelsRef.current.slice();
-    const key = activePlaylistUrlRef.current;
-    // Counters and accumulator are captured by the task closure.
-    const counters = { alive: 0, dead: 0 };
-    const updates: ChannelStatusRecord[] = [];
-
-    const scanTask = async () => {
+  /** Inline (non-background) scan — the fallback path. Same logic, no service. */
+  const runInlineScan = useCallback(
+    async (
+      snapshot: Channel[],
+      timeoutMs: number,
+      key: string,
+      counters: { alive: number; dead: number },
+      updates: ChannelStatusRecord[],
+    ) => {
       for (let i = 0; i < snapshot.length; i++) {
         if (scanAbortRef.current) break;
         const ch = snapshot[i];
-
-        // Update visible state. These setters are no-ops while the app is
-        // backgrounded, but they flush on resume so the UI catches up.
         setScanProgress(i);
         setStatusMsg(`Scanning ${i + 1}/${snapshot.length}: ${ch.name}`);
         setChannels((prev) =>
           prev.map((c) => (c.url === ch.url ? { ...c, status: 'scanning' } : c)),
         );
-
-        // Update the foreground-service notification text.
-        try {
-          await BackgroundActions.updateNotification({
-            taskTitle: 'IPTV Scan running',
-            taskDesc: `${i + 1}/${snapshot.length} — ${truncate(ch.name, 40)}`,
-            progressBar: { max: snapshot.length, value: i + 1 },
-          });
-        } catch {
-          /* notification update is best-effort */
-        }
 
         const ok = await testStream(ch.url, timeoutMs);
 
@@ -364,7 +380,6 @@ export default function App() {
         else counters.dead++;
         const now = new Date().toISOString();
         updates.push({ url: ch.url, status: ok ? 'ok' : 'bad', lastCheckedAt: now });
-
         setChannels((prev) =>
           prev.map((c) =>
             c.url === ch.url
@@ -373,7 +388,6 @@ export default function App() {
           ),
         );
 
-        // Persist every 10 channels so a force-kill can't wipe everything.
         if (key && updates.length % 10 === 0) {
           try {
             await mergeChannelStatuses(key, updates.slice(-10));
@@ -382,28 +396,121 @@ export default function App() {
           }
         }
       }
-    };
+    },
+    [],
+  );
 
-    const options = {
-      taskName: 'IPTV Scan',
-      taskTitle: 'Scanning channels...',
-      taskDesc: `0/${total}`,
-      taskIcon: { name: 'ic_launcher', type: 'mipmap' },
-      color: '#4f8cff',
-      linkingURI: 'iptvplayer://',
-      progressBar: { max: total, value: 0 },
-    };
+  const handleScan = useCallback(async () => {
+    if (channelsRef.current.length === 0) return;
+    if (scanning) return;
 
+    setScanning(true);
+    scanAbortRef.current = false;
+    const total = channelsRef.current.length;
+    setScanTotal(total);
+    setScanProgress(0);
+
+    const timeoutMs = 8000;
+    const snapshot = channelsRef.current.slice();
+    const key = activePlaylistUrlRef.current;
+    const counters = { alive: 0, dead: 0 };
+    const updates: ChannelStatusRecord[] = [];
+
+    // Step 1: ask for POST_NOTIFICATIONS permission on Android 13+. If
+    // denied we still attempt to start the service — failure to start is
+    // caught below and falls back to inline scanning.
+    await ensureNotificationPermission();
+
+    // Step 2: try to start the background foreground-service scan.
+    let bgStarted = false;
     try {
+      const scanTask = async () => {
+        for (let i = 0; i < snapshot.length; i++) {
+          if (scanAbortRef.current) break;
+          const ch = snapshot[i];
+
+          setScanProgress(i);
+          setStatusMsg(`Scanning ${i + 1}/${snapshot.length}: ${ch.name}`);
+          setChannels((prev) =>
+            prev.map((c) => (c.url === ch.url ? { ...c, status: 'scanning' } : c)),
+          );
+
+          // Update the foreground-service notification text. Best-effort.
+          try {
+            await BackgroundActions.updateNotification({
+              taskTitle: 'IPTV Scan running',
+              taskDesc: `${i + 1}/${snapshot.length} — ${truncate(ch.name, 40)}`,
+              progressBar: { max: snapshot.length, value: i + 1 },
+            });
+          } catch {
+            /* ignore */
+          }
+
+          const ok = await testStream(ch.url, timeoutMs);
+
+          if (scanAbortRef.current) {
+            setChannels((prev) =>
+              prev.map((c) => (c.url === ch.url ? { ...c, status: 'unknown' } : c)),
+            );
+            break;
+          }
+
+          if (ok) counters.alive++;
+          else counters.dead++;
+          const now = new Date().toISOString();
+          updates.push({ url: ch.url, status: ok ? 'ok' : 'bad', lastCheckedAt: now });
+          setChannels((prev) =>
+            prev.map((c) =>
+              c.url === ch.url
+                ? { ...c, status: ok ? 'ok' : 'bad', lastCheckedAt: now }
+                : c,
+            ),
+          );
+
+          if (key && updates.length % 10 === 0) {
+            try {
+              await mergeChannelStatuses(key, updates.slice(-10));
+            } catch {
+              /* ignore */
+            }
+          }
+        }
+      };
+
+      const options = {
+        taskName: 'IPTVScan',
+        taskTitle: 'Scanning channels...',
+        taskDesc: `0/${total}`,
+        taskIcon: { name: 'ic_launcher', type: 'mipmap' },
+        color: '#4f8cff',
+        linkingURI: 'iptvplayer://',
+        progressBar: { max: total, value: 0 },
+        // Required on Android 14+ (API 34+) — the manifest declares the
+        // service type as dataSync, and we must pass the same type here
+        // or startForeground() throws ForegroundServiceTypeNotAllowed.
+        foregroundServiceType: ['dataSync'] as Array<'dataSync'>,
+      };
+
       await BackgroundActions.start(scanTask, options);
+      bgStarted = true;
     } catch (e: any) {
-      // Fallback: run inline (no foreground service). Shouldn't happen in
-      // practice but keeps the app usable if the service can't start.
-      setStatusMsg('Background service unavailable — scanning inline...');
-      await scanTask();
+      // Background service couldn't start (permission denied, OEM
+      // restrictions, ForegroundServiceStartNotAllowedException, etc.).
+      // Fall back to inline scanning so the app stays usable.
+      console.warn('BackgroundActions.start failed, falling back to inline:', e);
+      setStatusMsg(
+        'Background service unavailable — scanning inline (' +
+          (e?.message || String(e)) +
+          ').',
+      );
     }
 
-    // Final persist of any remaining updates.
+    // Step 3: if background didn't start, run inline.
+    if (!bgStarted) {
+      await runInlineScan(snapshot, timeoutMs, key, counters, updates);
+    }
+
+    // Step 4: persist any remaining updates.
     if (key && updates.length > 0) {
       try {
         await mergeChannelStatuses(key, updates);
@@ -412,6 +519,7 @@ export default function App() {
       }
     }
 
+    // Step 5: clean up dead channels and report.
     if (!scanAbortRef.current) {
       setChannels((prev) => prev.filter((c) => c.status !== 'bad'));
       setStatusMsg(
@@ -426,12 +534,14 @@ export default function App() {
     setScanning(false);
     setScanProgress(0);
     setScanTotal(0);
-  }, [scanning]);
+  }, [scanning, ensureNotificationPermission, runInlineScan]);
 
   const handleStopScan = useCallback(async () => {
     scanAbortRef.current = true;
     try {
-      await BackgroundActions.stop();
+      if (BackgroundActions.isRunning()) {
+        await BackgroundActions.stop();
+      }
     } catch {
       /* ignore */
     }
