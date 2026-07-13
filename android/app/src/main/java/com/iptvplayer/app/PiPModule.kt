@@ -22,7 +22,7 @@ class PiPModule(reactContext: ReactApplicationContext) :
 
     @ReactMethod
     fun enterPiP() {
-        val activity = currentActivity as? MainActivity ?: return
+        val activity = getCurrentActivity() as? MainActivity ?: return
         activity.enterPiPIfNeeded()
     }
 
