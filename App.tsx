@@ -6,10 +6,13 @@
  *  - Saved playlists library (AsyncStorage) — tap to reload, long-press to delete
  *  - Channel list with logos + group filter + search
  *  - Click to play (HLS via ExoPlayer — no CORS issues)
- *  - Random channel button (prefers alive ones after a scan)
- *  - Scan & Clean: HEAD/GET each stream with timeout, mark dead, remove
- *    Reachability results are PERSISTED — next time you load the same
- *    playlist, the green/red dots come back without re-scanning.
+ *  - Random channel button — strict priority: alive (ok) > unknown, never dead
+ *  - Scan & Clean: runs as a BACKGROUND FOREGROUND-SERVICE so you can leave
+ *    the app and the scan keeps going. A persistent notification shows the
+ *    progress. Reachability results are PERSISTED to AsyncStorage — next time
+ *    you load the same playlist the green/red dots come back without rescanning.
+ *  - Picture-in-Picture: pressing Home while a stream is playing slides the
+ *    video into a floating window that stays on top of other apps.
  *  - Export: share the cleaned list as .m3u via Android share sheet
  *
  * Why this works where the browser version didn't:
@@ -32,9 +35,12 @@ import {
   Alert,
   ActivityIndicator,
   Dimensions,
+  NativeModules,
+  AppState,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import Video, { VideoRef, ResizeMode } from 'react-native-video';
+import BackgroundActions from 'react-native-background-actions';
 import {
   SavedPlaylist,
   ChannelStatusRecord,
@@ -46,6 +52,13 @@ import {
   clearChannelStatuses,
   defaultPlaylistName,
 } from './src/storage/Storage';
+
+// Native bridge to the Picture-in-Picture Kotlin module. May be undefined on
+// non-Android or if the native side failed to register — guard every call.
+const PiPModule: {
+  setVideoActive: (active: boolean) => void;
+  enterPiP: () => void;
+} | undefined = NativeModules.PiPModule;
 
 // ---------- Types ----------
 interface Channel {
@@ -268,83 +281,160 @@ export default function App() {
   }, []);
 
   // ---------- Random ----------
+  // Priority: alive (status === 'ok') first. Only if there are no alive
+  // channels do we fall back to 'unknown'. Dead ('bad') channels are NEVER
+  // selected.
   const handleRandom = useCallback(() => {
-    const alive = channelsRef.current.filter((c) => c.status !== 'bad');
-    const pool = alive.length > 0 ? alive : channelsRef.current;
-    if (pool.length === 0) return;
+    const all = channelsRef.current;
+    if (all.length === 0) return;
+    const alive = all.filter((c) => c.status === 'ok');
+    const unknown = all.filter((c) => c.status === 'unknown');
+    const pool = alive.length > 0 ? alive : unknown;
+    if (pool.length === 0) {
+      setStatusMsg('Nothing to pick — all channels are marked dead. Run Reset or rescan.');
+      return;
+    }
     const ch = pool[Math.floor(Math.random() * pool.length)];
     playChannel(ch);
-    setStatusMsg('Random: ' + ch.name);
+    setStatusMsg(
+      'Random: ' +
+        ch.name +
+        (alive.length > 0 ? ` (alive pool: ${alive.length})` : ` (unknown pool: ${unknown.length})`),
+    );
   }, [playChannel]);
 
-  // ---------- Scan & Clean ----------
+  // ---------- Scan & Clean (background foreground-service) ----------
+  //
+  // The scan runs inside react-native-background-actions, which spawns an
+  // Android foreground service with a persistent notification. You can press
+  // Home, switch apps, even turn the screen off — the scan keeps running and
+  // the notification shows live progress. Results are persisted to
+  // AsyncStorage every 10 channels so a force-kill won't lose much work.
   const handleScan = useCallback(async () => {
     if (channelsRef.current.length === 0) return;
+    if (scanning) return;
+
     setScanning(true);
     scanAbortRef.current = false;
-    setScanTotal(channelsRef.current.length);
+    const total = channelsRef.current.length;
+    setScanTotal(total);
     setScanProgress(0);
 
     const timeoutMs = 8000;
     const snapshot = channelsRef.current.slice();
-    let alive = 0, dead = 0;
-    /** Pending reachability updates to persist at the end of the scan. */
+    const key = activePlaylistUrlRef.current;
+    // Counters and accumulator are captured by the task closure.
+    const counters = { alive: 0, dead: 0 };
     const updates: ChannelStatusRecord[] = [];
 
-    // Run scan sequentially (parallel would hammer the network).
-    for (let i = 0; i < snapshot.length; i++) {
-      if (scanAbortRef.current) break;
-      const ch = snapshot[i];
-      setScanProgress(i);
-      setStatusMsg(`Scanning ${i + 1}/${snapshot.length}: ${ch.name}`);
+    const scanTask = async () => {
+      for (let i = 0; i < snapshot.length; i++) {
+        if (scanAbortRef.current) break;
+        const ch = snapshot[i];
 
-      // Mark scanning in place
-      setChannels((prev) =>
-        prev.map((c) => (c.url === ch.url ? { ...c, status: 'scanning' } : c)),
-      );
-
-      const ok = await testStream(ch.url, timeoutMs);
-      if (scanAbortRef.current) {
-        // User stopped mid-test — restore unknown
+        // Update visible state. These setters are no-ops while the app is
+        // backgrounded, but they flush on resume so the UI catches up.
+        setScanProgress(i);
+        setStatusMsg(`Scanning ${i + 1}/${snapshot.length}: ${ch.name}`);
         setChannels((prev) =>
-          prev.map((c) => (c.url === ch.url ? { ...c, status: 'unknown' } : c)),
+          prev.map((c) => (c.url === ch.url ? { ...c, status: 'scanning' } : c)),
         );
-        break;
+
+        // Update the foreground-service notification text.
+        try {
+          await BackgroundActions.updateNotification({
+            taskTitle: 'IPTV Scan running',
+            taskDesc: `${i + 1}/${snapshot.length} — ${truncate(ch.name, 40)}`,
+            progressBar: { max: snapshot.length, value: i + 1 },
+          });
+        } catch {
+          /* notification update is best-effort */
+        }
+
+        const ok = await testStream(ch.url, timeoutMs);
+
+        if (scanAbortRef.current) {
+          setChannels((prev) =>
+            prev.map((c) => (c.url === ch.url ? { ...c, status: 'unknown' } : c)),
+          );
+          break;
+        }
+
+        if (ok) counters.alive++;
+        else counters.dead++;
+        const now = new Date().toISOString();
+        updates.push({ url: ch.url, status: ok ? 'ok' : 'bad', lastCheckedAt: now });
+
+        setChannels((prev) =>
+          prev.map((c) =>
+            c.url === ch.url
+              ? { ...c, status: ok ? 'ok' : 'bad', lastCheckedAt: now }
+              : c,
+          ),
+        );
+
+        // Persist every 10 channels so a force-kill can't wipe everything.
+        if (key && updates.length % 10 === 0) {
+          try {
+            await mergeChannelStatuses(key, updates.slice(-10));
+          } catch {
+            /* ignore */
+          }
+        }
       }
-      if (ok) alive++;
-      else dead++;
-      const now = new Date().toISOString();
-      updates.push({ url: ch.url, status: ok ? 'ok' : 'bad', lastCheckedAt: now });
-      setChannels((prev) =>
-        prev.map((c) =>
-          c.url === ch.url
-            ? { ...c, status: ok ? 'ok' : 'bad', lastCheckedAt: now }
-            : c,
-        ),
-      );
+    };
+
+    const options = {
+      taskName: 'IPTV Scan',
+      taskTitle: 'Scanning channels...',
+      taskDesc: `0/${total}`,
+      taskIcon: { name: 'ic_launcher', type: 'mipmap' },
+      color: '#4f8cff',
+      linkingURI: 'iptvplayer://',
+      progressBar: { max: total, value: 0 },
+    };
+
+    try {
+      await BackgroundActions.start(scanTask, options);
+    } catch (e: any) {
+      // Fallback: run inline (no foreground service). Shouldn't happen in
+      // practice but keeps the app usable if the service can't start.
+      setStatusMsg('Background service unavailable — scanning inline...');
+      await scanTask();
     }
 
-    // Persist the reachability results for next launch.
-    const key = activePlaylistUrlRef.current;
+    // Final persist of any remaining updates.
     if (key && updates.length > 0) {
-      await mergeChannelStatuses(key, updates);
+      try {
+        await mergeChannelStatuses(key, updates);
+      } catch {
+        /* ignore */
+      }
     }
 
     if (!scanAbortRef.current) {
-      // Remove dead channels
       setChannels((prev) => prev.filter((c) => c.status !== 'bad'));
-      setStatusMsg(`Scan done. ${alive} alive, ${dead} dead removed.`);
+      setStatusMsg(
+        `Scan done. ${counters.alive} alive, ${counters.dead} dead removed.`,
+      );
     } else {
-      setStatusMsg(`Scan stopped. ${alive} alive, ${dead} dead so far.`);
+      setStatusMsg(
+        `Scan stopped. ${counters.alive} alive, ${counters.dead} dead so far.`,
+      );
     }
 
     setScanning(false);
     setScanProgress(0);
     setScanTotal(0);
-  }, []);
+  }, [scanning]);
 
-  const handleStopScan = useCallback(() => {
+  const handleStopScan = useCallback(async () => {
     scanAbortRef.current = true;
+    try {
+      await BackgroundActions.stop();
+    } catch {
+      /* ignore */
+    }
   }, []);
 
   // ---------- Reset reachability ----------
@@ -409,13 +499,50 @@ export default function App() {
   // ---------- Video callbacks ----------
   const onVideoLoad = useCallback(() => {
     setIsLoadingVideo(false);
+    // Tell native code that a video is now actively playing so it can enter
+    // Picture-in-Picture when the user presses Home.
+    PiPModule?.setVideoActive(true);
   }, []);
   const onVideoError = useCallback((e: any) => {
     setIsLoadingVideo(false);
+    PiPModule?.setVideoActive(false);
     const err = e?.error;
     const msg =
       err?.errorString || err?.message || 'Unknown playback error';
     setVideoError(msg);
+  }, []);
+
+  // ---------- PiP / lifecycle ----------
+  // When the user picks a channel we mark the video as active so the next
+  // Home press slides into PiP. When the channel is cleared or the app loses
+  // focus without an active stream, we clear the flag.
+  useEffect(() => {
+    if (currentChannel && !videoError) {
+      PiPModule?.setVideoActive(true);
+    } else {
+      PiPModule?.setVideoActive(false);
+    }
+  }, [currentChannel, videoError]);
+
+  // If the user explicitly backgrounds the app via Home while a stream is
+  // playing, the native onUserLeaveHint handles auto-PiP. Nothing extra to do
+  // from JS — but we still want to refresh channel list from AsyncStorage on
+  // foreground in case a background scan was running and the activity was
+  // recreated.
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state !== 'active') return;
+      const key = activePlaylistUrlRef.current;
+      if (!key || channelsRef.current.length === 0) return;
+      // Refresh persisted statuses — they may have been updated by a
+      // background scan that survived the activity being paused.
+      (async () => {
+        const stored = await loadChannelStatuses(key);
+        if (stored.length === 0) return;
+        setChannels((prev) => applyStoredStatuses(prev, stored));
+      })();
+    });
+    return () => sub.remove();
   }, []);
 
   // ---------- Stats ----------
@@ -667,6 +794,16 @@ export default function App() {
                 </Text>
               </View>
             ) : null}
+            {/* Manual PiP trigger — auto-PiP on Home press also works. */}
+            {PiPModule ? (
+              <TouchableOpacity
+                style={styles.pipBadge}
+                onPress={() => PiPModule?.enterPiP()}
+                disabled={!!videoError}
+              >
+                <Text style={styles.pipBadgeText}>⧉ PiP</Text>
+              </TouchableOpacity>
+            ) : null}
           </>
         ) : (
           <View style={styles.videoOverlay}>
@@ -721,6 +858,10 @@ export default function App() {
 }
 
 // ---------- Helpers ----------
+function truncate(s: string, n: number): string {
+  return s.length > n ? s.slice(0, n - 1) + '…' : s;
+}
+
 function formatRelative(iso: string | null | undefined): string {
   if (!iso) return '';
   const then = new Date(iso).getTime();
@@ -914,6 +1055,23 @@ const styles = StyleSheet.create({
     color: '#e6e8ec',
     fontSize: 13,
     textAlign: 'center',
+  },
+  pipBadge: {
+    position: 'absolute',
+    top: 8,
+    right: 8,
+    backgroundColor: 'rgba(0,0,0,0.65)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.18)',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 14,
+  },
+  pipBadgeText: {
+    color: '#e6e8ec',
+    fontSize: 11,
+    fontWeight: '600',
+    letterSpacing: 0.3,
   },
   nowPlaying: {
     paddingHorizontal: 16,

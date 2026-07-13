@@ -10,9 +10,12 @@ import com.facebook.react.ReactNativeApplicationEntryPoint.loadReactNative
 class MainApplication : Application(), ReactApplication {
 
   override val reactHost: ReactHost by lazy {
+    val packageList = PackageList(this).packages
+    // Register our hand-written PiP module so JS can import NativeModules.PiPModule.
+    packageList.add(PiPPackage())
     getDefaultReactHost(
       context = applicationContext,
-      packageList = PackageList(this).packages,
+      packageList = packageList,
     )
   }
 
